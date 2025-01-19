@@ -1,0 +1,10 @@
+[package]
+name = "chuni-leap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = "0.28.0"
+itertools = "0.14.0"
+leaprs = { version = "0.2.2", features = ["glam"] }
+serde = { version = "1.0.217", features = ["derive"] }
