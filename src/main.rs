@@ -57,7 +57,7 @@ impl eframe::App for ChuniLeapApp {
         let mut state = self.air_sensor_state.lock();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.checkbox(&mut state.config.visualize, "Visualize Slider");
+            ui.checkbox(&mut state.config.visualize, "Visualize Sensors");
             ui.add_enabled_ui(state.config.visualize, |ui| {
                 ui.vertical(|ui| {
                     for &enabled in state.visualized_sensors.iter().rev() {
