@@ -1,98 +1,114 @@
-use std::{error::Error, iter::once};
+mod air_sensor;
 
-use glam::Vec3;
-use itertools::{chain, Itertools};
-use leaprs::{Connection, ConnectionConfig, DigitRef, EventRef, HandRef, HandType, LeapVectorRef};
+use std::{error::Error, sync::Arc, thread};
 
-/// https://users.rust-lang.org/t/max-and-min-of-vec-vec3/109714/5
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Aabb {
-    pub min: Vec3,
-    pub max: Vec3,
-}
-
-impl Aabb {
-    pub fn from_point(point: Vec3) -> Self {
-        Self {
-            min: point,
-            max: point,
-        }
-    }
-
-    /// Returns [`None`] if there are no points.
-    pub fn from_points(points: impl IntoIterator<Item = Vec3>) -> Option<Self> {
-        points.into_iter().map(Self::from_point).reduce(Self::union)
-    }
-
-    pub fn from_hand(hand: HandRef) -> Self {
-        Self::from_points(
-            hand.digits()
-                .iter()
-                .flat_map(|d| d.bones())
-                .map(|b| b.next_joint().into())
-                .chain(once(hand.palm().position().into())),
-        )
-        .unwrap()
-    }
-
-    pub fn union(self, other: Self) -> Self {
-        Self {
-            min: self.min.min(other.min),
-            max: self.max.max(other.max),
-        }
-    }
-}
-
-// https://docs.ultraleap.com/api-reference/tracking-api/leapc-guide/leap-concepts.html
-
-struct SensorConfig {
-    pub bottom: f32,
-    pub step: f32,
-}
-
-impl SensorConfig {
-    pub fn sensor_index(&self, pos: Vec3) -> Option<usize> {
-        let index = ((pos.y - self.bottom) / self.step).floor() as i32;
-        if (0..6).contains(&index) {
-            Some(index as usize)
-        } else {
-            None
-        }
-    }
-}
+use air_sensor::{AirSensor, AirSensorState};
+use eframe::egui;
+use egui::{Color32, Sense, Vec2};
+use log::error;
+use parking_lot::Mutex;
+use serde::{de::DeserializeOwned, Serialize};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut c = Connection::create(ConnectionConfig::default())?;
-    c.open()?;
+    env_logger::init();
 
-    // units: mm
-    let sensor_config = SensorConfig {
-        bottom: 100.0,
-        step: 25.0,
-    };
+    eframe::run_native(
+        "chuni-leap",
+        eframe::NativeOptions::default(),
+        Box::new(|cc| Ok(Box::new(ChuniLeapApp::new(cc)))),
+    )?;
 
-    loop {
-        if let Ok(msg) = c.poll(1000) {
-            if let EventRef::Tracking(e) = msg.event() {
-                let mut sensors = [false; 6];
-                for hand in e.hands().iter() {
-                    for pos in hand
-                        .digits()
-                        .iter()
-                        .flat_map(|d| d.bones())
-                        .map(|b| b.next_joint().into_glam())
-                        .chain(once(hand.palm().position().into_glam()))
-                    {
-                        if let Some(index) = sensor_config.sensor_index(pos) {
-                            sensors[index] = true;
+    Ok(())
+}
+
+#[derive(Default)]
+struct ChuniLeapApp {
+    air_sensor_state: Arc<Mutex<AirSensorState>>,
+}
+
+impl ChuniLeapApp {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        let app = match cc.storage {
+            Some(storage) => Self {
+                air_sensor_state: Arc::new(Mutex::new(AirSensorState {
+                    config: deserialize_storage(storage, storage_keys::AIR_SENSOR_CONFIG),
+                    ..Default::default()
+                })),
+            },
+            None => Self::default(),
+        };
+
+        let air_sensor_state = app.air_sensor_state.clone();
+        let ctx = cc.egui_ctx.clone();
+        thread::spawn(move || {
+            // FIXME: sane error handling idk it's midnight right now
+            AirSensor::new(air_sensor_state, ctx)
+                .unwrap()
+                .run()
+                .unwrap();
+        });
+
+        app
+    }
+}
+
+impl eframe::App for ChuniLeapApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut state = self.air_sensor_state.lock();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.checkbox(&mut state.config.visualize, "Visualize Slider");
+            ui.add_enabled_ui(state.config.visualize, |ui| {
+                ui.vertical(|ui| {
+                    for &enabled in state.visualized_sensors.iter().rev() {
+                        let (rect, _) = ui.allocate_at_least(
+                            Vec2::new(ui.available_width(), 10.),
+                            Sense::hover(),
+                        );
+                        if enabled {
+                            ui.painter().rect_filled(rect, 0., Color32::WHITE);
+                        } else {
+                            ui.painter().rect_stroke(rect, 0., (1., Color32::WHITE));
                         }
                     }
-                }
-                for sensor in sensors {
-                    print!("{}", sensor as u32);
-                }
-                println!();
-            }
-        }
+                });
+            });
+        });
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        serialize_storage(
+            storage,
+            storage_keys::AIR_SENSOR_CONFIG,
+            &self.air_sensor_state.lock().config,
+        );
+    }
+}
+
+fn deserialize_storage<T>(storage: &dyn eframe::Storage, key: &str) -> T
+where
+    T: DeserializeOwned + Default,
+{
+    storage
+        .get_string(key)
+        .and_then(|v| {
+            serde_json::from_str(&v)
+                .map_err(|e| error!("Failed to deserialize {key}: {e}"))
+                .ok()
+        })
+        .unwrap_or_default()
+}
+
+fn serialize_storage<T>(storage: &mut dyn eframe::Storage, key: &str, value: &T)
+where
+    T: Sized + Serialize,
+{
+    match serde_json::to_string(value) {
+        Ok(value) => storage.set_string(key, value),
+        Err(e) => error!("Failed to serialize {key}: {e}"),
+    };
+}
+
+mod storage_keys {
+    pub const AIR_SENSOR_CONFIG: &str = "air_sensor_config";
 }
